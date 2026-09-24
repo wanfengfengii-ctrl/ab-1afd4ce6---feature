@@ -48,10 +48,34 @@ await check('首页 GET / 返回 200 且包含关键节点', async () => {
   }
 });
 
+await check('首页包含缓变加载模式切换、置高上限录入与两套缓变结论容器', async () => {
+  const res = await get('/');
+  const html = await res.text();
+  for (const token of ['name="mode"', 'value="ramp"', 'id="max-rise-pins"',
+    'id="result-ramp-feasible"', 'id="result-ramp-infeasible"', 'id="ramp-jumps"']) {
+    assert(html.includes(token), `首页缺少缓变模式节点 ${token}`);
+  }
+});
+
+await check('闭环裁决关键节点（steps-body / 无解诊断）仍然保留', async () => {
+  const res = await get('/');
+  const html = await res.text();
+  for (const token of ['id="result-feasible"', 'id="result-infeasible"', 'id="inf-diagnosis"']) {
+    assert(html.includes(token), `首页缺少原有闭环节点 ${token}`);
+  }
+});
+
 await check('app.js 中加载了后台 Worker（js/worker.js）', async () => {
   const res = await get('/js/app.js');
   const js = await res.text();
   assert(/worker\.js/.test(js), 'app.js 未引用 worker.js');
+});
+
+await check('worker.js 同时分发闭环裁决与缓变加载两种模式', async () => {
+  const res = await get('/js/worker.js');
+  const js = await res.text();
+  assert(/solveRamping/.test(js), 'worker.js 未接入缓变加载 solveRamping');
+  assert(/solveModel/.test(js), 'worker.js 丢失原有闭环 solveModel');
 });
 
 await check('健康检查端点 /healthz 返回 200 ok', async () => {

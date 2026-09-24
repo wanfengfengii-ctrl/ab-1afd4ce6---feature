@@ -41,8 +41,8 @@ services:
       - -c
       - |
         set -e
-        echo "==== [1/3] 代码测试（node --test，含 n! 暴力对拍） ===="
-        node --test test/solver.test.mjs
+        echo "==== [1/3] 代码测试（node --test，闭环 n! 对拍 + 缓变 Fubini 全枚举对拍） ===="
+        node --test test/solver.test.mjs test/ramping.test.mjs
         echo "==== [2/3] 构建检查 ===="
         node scripts/build-check.mjs
         echo "==== [3/3] HTTP 冒烟（http://web:80） ===="

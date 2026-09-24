@@ -3,21 +3,33 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>扫描向量浪涌约束闭环排序 · 全局裁决</title>
+  <title>扫描向量加载裁决 · 闭环全局排序 ＋ 备案顺序缓变加载</title>
   <link rel="stylesheet" href="css/style.css" />
 </head>
 <body>
   <header class="topbar">
-    <h1>扫描向量浪涌约束 · 闭环加载顺序全局裁决</h1>
+    <h1>扫描向量加载裁决 · 闭环全局排序 ＋ 备案顺序缓变加载</h1>
     <p class="subtitle">
-      全零安全态出发，每个向量恰好执行一次并回到全零态；逐跳浪涌（仅计 0→1 引脚权重）≤ 限额。
-      完整比较全部 n! 条闭环顺序：先取全程翻转位数最小，并列按编号序列字典序取最小。
+      两种加载模式并存：<strong>闭环全局裁决</strong>完整比较全部 n! 条闭环顺序（先取全程翻转位数最小，并列按编号序列字典序）；
+      <strong>缓变加载</strong>严格按录入（备案）顺序从全零出发并回零，每次正式跳转前先统一降位、再把待置高引脚全局最优分组，
+      完整比较所有分组与阶段顺序，先取暂态总数最少、并列按各阶段置高引脚 P 序列字典序取最小。
     </p>
   </header>
 
   <main class="layout">
     <!-- 左侧：输入区 -->
     <section class="panel" aria-label="参数录入">
+      <div class="mode-switch" role="group" aria-label="加载模式">
+        <label class="mode-option">
+          <input type="radio" name="mode" value="closed" checked />
+          <span>闭环加载顺序全局裁决（n! 完整比较）</span>
+        </label>
+        <label class="mode-option">
+          <input type="radio" name="mode" value="ramp" />
+          <span>缓变加载（按录入/备案顺序，先降位再分组置高）</span>
+        </label>
+      </div>
+
       <div class="panel-head">
         <h2>1. 参数与引脚权重</h2>
         <button id="btn-sample" class="btn btn-ghost" type="button">填入示例</button>
@@ -29,6 +41,9 @@
         </label>
         <label>浪涌限额（非负整数）
           <input id="limit" type="number" min="0" step="1" value="6" />
+        </label>
+        <label id="maxrise-wrap" class="ramp-only">每阶段最多同时置高引脚数（1–位数）
+          <input id="max-rise-pins" type="number" min="1" step="1" value="2" />
         </label>
       </div>
 
@@ -57,13 +72,14 @@
         <h2>3. 文本导入 / 导出</h2>
       </div>
       <details class="import-box">
-        <summary>导入格式说明：PINS / LIMIT / W / 编号 掩码（# 注释）</summary>
+        <summary>导入格式说明：PINS / LIMIT / W / 可选 MAXRISE / 编号 掩码（# 注释）</summary>
         <pre class="format-help">PINS 8
 LIMIT 6
 W 2 1 3 1 2 1 1 1
+MAXRISE 2
 V1 00101010
 V2 11000001
-# 每行一个向量：编号 + 空白 + 掩码</pre>
+# 每行一个向量：编号 + 空白 + 掩码；MAXRISE 仅缓变加载需要</pre>
       </details>
       <textarea id="import-text" rows="8" spellcheck="false"
         placeholder="PINS 8&#10;LIMIT 6&#10;W 2 1 3 1 2 1 1 1&#10;V1 00101010&#10;..."></textarea>
@@ -73,7 +89,7 @@ V2 11000001
       </div>
 
       <div class="action-row">
-        <button id="btn-solve" class="btn btn-primary" type="button">执行全局裁决</button>
+        <button id="btn-solve" class="btn btn-primary" type="button">执行闭环全局裁决</button>
         <span id="solve-hint" class="solve-hint"></span>
       </div>
     </section>
@@ -87,7 +103,7 @@ V2 11000001
 
       <div id="result-empty" class="placeholder">
         <p>尚未产生结论。</p>
-        <p class="muted">录入或导入数据后点击「执行全局裁决」；任何一次编辑都会立刻清空本区域的旧结论。</p>
+        <p class="muted">录入或导入数据后点击执行；任何一次编辑（含切换模式、修改置高上限）都会立刻清空本区域的旧结论。</p>
       </div>
 
       <div id="result-feasible" hidden>
@@ -121,11 +137,35 @@ V2 11000001
         <p>已完整比较全部 <strong id="inf-total"></strong> 条闭环顺序，无任何顺序能让每一跳浪涌都不超过限额。</p>
         <div id="inf-diagnosis" class="diagnosis"></div>
       </div>
+
+      <div id="result-ramp-feasible" hidden>
+        <h2 class="result-title">✅ 缓变加载方案（按录入顺序，全局最优分组）</h2>
+        <div id="ramp-order-chain" class="order-chain"></div>
+        <dl class="stats">
+          <div><dt>累计插入暂态总数</dt><dd><strong id="ramp-stat-transients"></strong></dd></div>
+          <div><dt>置高阶段（分组）总数</dt><dd id="ramp-stat-groups"></dd></div>
+          <div><dt>正式采样点数</dt><dd id="ramp-stat-sampled"></dd></div>
+        </dl>
+        <p class="muted small">
+          每跳先一次性降位，再按全局枚举的最优有序分组依次置高；裁决先最小化暂态总数，
+          并列时按各置高阶段 P 序列字典序取最小（非贪心装箱）。每个正式向量均在其原掩码处采样。
+        </p>
+
+        <h3>按正式跳转展开的暂态链</h3>
+        <div id="ramp-jumps" class="ramp-jumps"></div>
+      </div>
+
+      <div id="result-ramp-infeasible" hidden>
+        <h2 class="result-title">❌ 缓变加载无法规划</h2>
+        <p>已按录入顺序逐跳完整枚举全部可行分组与阶段顺序，下列正式跳转无法在限额与置高上限内完成切换。</p>
+        <div id="ramp-failures" class="diagnosis"></div>
+        <div id="ramp-partial" class="ramp-jumps partial"></div>
+      </div>
     </section>
   </main>
 
   <footer class="footer">
-    纯静态页面 · 全局子集动态规划（精确等价于 n! 全排列穷举）· 计算在 Web Worker 中执行
+    纯静态页面 · 闭环：子集 DP（精确等价 n! 穷举）｜ 缓变：可行块字典序枚举＋记忆化全局分组（独立 Fubini 全枚举对拍验证）· 计算在 Web Worker 中执行
   </footer>
 
   <script type="module" src="js/app.js"></script>
