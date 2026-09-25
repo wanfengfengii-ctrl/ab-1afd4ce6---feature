@@ -32,6 +32,18 @@
         </label>
       </div>
 
+      <div class="softstart-block">
+        <div class="soft-title">缓变加载参数（与闭环裁决相互独立；点击下方「执行缓变加载规划」生效）</div>
+        <label class="soft-cap" for="soft-cap">每个切换阶段最多同时置高的引脚数（1–20）
+          <input id="soft-cap" type="number" min="1" max="20" step="1" value="2" />
+        </label>
+        <p class="muted small soft-hint">
+          严格按当前录入/备案的向量编号顺序执行（不做闭环重排）：系统从全零出发、逐向量在其原掩码处采样、最后回零；
+          每次正式跳转前先一次性降位，再把待置高引脚完整分组（每组权重和 ≤ 浪涌限额、引脚数 ≤ 上限）。
+          完整比较全部分组与阶段顺序：先取插入暂态总数最少，并列按各阶段置高引脚 P 序列字典序最小。
+        </p>
+      </div>
+
       <div class="weights-block">
         <div class="weights-title">各引脚浪涌权重（P1 … P<span id="pins-tail">8</span>，整数 ≥ 0）</div>
         <div id="weights-grid" class="weights-grid"></div>
@@ -57,9 +69,10 @@
         <h2>3. 文本导入 / 导出</h2>
       </div>
       <details class="import-box">
-        <summary>导入格式说明：PINS / LIMIT / W / 编号 掩码（# 注释）</summary>
+        <summary>导入格式说明：PINS / LIMIT / 可选 MAXP / W / 编号 掩码（# 注释）</summary>
         <pre class="format-help">PINS 8
 LIMIT 6
+MAXP 2                  # 可选：启用缓变加载，每阶段最多同时置高 2 个引脚
 W 2 1 3 1 2 1 1 1
 V1 00101010
 V2 11000001
@@ -74,10 +87,10 @@ V2 11000001
 
       <div class="action-row">
         <button id="btn-solve" class="btn btn-primary" type="button">执行全局裁决</button>
+        <button id="btn-soft-solve" class="btn" type="button">执行缓变加载规划</button>
         <span id="solve-hint" class="solve-hint"></span>
       </div>
     </section>
-
     <!-- 右侧：结论区 -->
     <section class="panel result-panel" aria-label="裁决结论">
       <div id="stale-banner" class="banner banner-stale" hidden>
@@ -87,7 +100,7 @@ V2 11000001
 
       <div id="result-empty" class="placeholder">
         <p>尚未产生结论。</p>
-        <p class="muted">录入或导入数据后点击「执行全局裁决」；任何一次编辑都会立刻清空本区域的旧结论。</p>
+        <p class="muted">录入或导入数据后点击执行按钮；不勾选缓变加载时做既有闭环顺序全局裁决，勾选后按录入顺序做缓变加载分组。任何一次编辑（含切换/修改上限）都会立刻清空本区域的旧报告。</p>
       </div>
 
       <div id="result-feasible" hidden>
@@ -120,6 +133,28 @@ V2 11000001
         <h2 class="result-title">❌ 不存在可行闭环顺序</h2>
         <p>已完整比较全部 <strong id="inf-total"></strong> 条闭环顺序，无任何顺序能让每一跳浪涌都不超过限额。</p>
         <div id="inf-diagnosis" class="diagnosis"></div>
+      </div>
+
+      <!-- 缓变加载结论（与闭环裁决相互独立，二者各自一块面板） -->
+      <div id="result-soft" hidden>
+        <h2 class="result-title">🟢 缓变加载切换方案（按录入/备案顺序）</h2>
+        <div id="soft-chain" class="order-chain"></div>
+        <dl class="stats">
+          <div><dt>插入暂态总数</dt><dd><strong id="soft-stat-transients"></strong></dd></div>
+          <div><dt>每阶段置高引脚上限</dt><dd id="soft-stat-cap"></dd></div>
+          <div><dt>正式向量数</dt><dd id="soft-stat-n"></dd></div>
+        </dl>
+        <p class="muted small" id="soft-meta"></p>
+
+        <h3>逐正式跳转：暂态前/后掩码、置高引脚、浪涌与采样点</h3>
+        <div id="soft-transitions" class="soft-transitions"></div>
+      </div>
+
+      <div id="result-soft-infeasible" hidden>
+        <h2 class="result-title">❌ 缓变加载无法完成分组</h2>
+        <p>已按当前录入顺序对每个正式跳转完整比较全部分组与阶段顺序，以下跳转不存在满足
+          “每组权重和 ≤ 浪涌限额、每组引脚数 ≤ 上限”的切换方案：</p>
+        <div id="soft-infeasible" class="diagnosis"></div>
       </div>
     </section>
   </main>

@@ -85,6 +85,38 @@ h3 { font-size: 14px; margin: 18px 0 8px; }
 
 .weights-block { margin-bottom: 4px; }
 .weights-title { color: var(--text-dim); font-size: 13px; margin-bottom: 6px; }
+
+/* 缓变加载参数区 */
+.softstart-block {
+  background: #0d1322;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.soft-title { color: var(--text-dim); font-size: 13px; margin-bottom: 8px; }
+.soft-cap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-dim);
+  font-size: 13px;
+  max-width: 320px;
+}
+.soft-cap input {
+  background: #0f1420;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 14px;
+}
+.soft-cap input:focus { outline: 2px solid var(--primary); }
+.soft-cap input.invalid {
+  border: 1px solid var(--error);
+  outline: 2px solid rgba(239, 68, 68, 0.35);
+}
+.soft-hint { margin: 8px 0 0; line-height: 1.6; }
 .weights-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(74px, 1fr));
@@ -309,4 +341,62 @@ h3 { font-size: 14px; margin: 18px 0 8px; }
   color: var(--text-dim);
   text-align: center;
   font-size: 12px;
+}
+
+/* ---- 缓变加载逐跳转卡片 ---- */
+.soft-transitions { display: flex; flex-direction: column; gap: 10px; }
+.hop-card {
+  background: #0d1322;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.hop-card.return-card { border-color: rgba(251, 191, 36, 0.4); }
+.hop-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.hop-head .hop-no { color: #94a3b8; font-size: 12px; }
+.hop-head .hop-name { font-weight: 700; }
+.hop-head .hop-counts { color: var(--text-dim); font-size: 12px; }
+.stage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.stage-table th {
+  color: var(--text-dim);
+  font-weight: 600;
+  text-align: left;
+  padding: 4px 6px;
+  white-space: nowrap;
+}
+.stage-table td {
+  padding: 4px 6px;
+  border-top: 1px solid var(--border);
+  vertical-align: top;
+}
+.stage-table td.bits {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 1px;
+}
+.stage-row-fall td { background: rgba(248, 113, 113, 0.05); }
+.stage-row-sample td { background: rgba(74, 222, 128, 0.08); }
+.stage-name { white-space: nowrap; }
+.stage-name .sample-tag {
+  color: var(--rise);
+  font-weight: 700;
+}
+.stage-name .fall-tag { color: #f87171; }
+.pins-cell .chip { margin: 0 4px 2px 0; display: inline-block; }
+.surge-cell { font-weight: 700; white-space: nowrap; }
+.surge-cell.over { color: var(--error); }
+.soft-infeasible-item {
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  color: #fca5a5;
+}
+.soft-infeasible-item code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
 }

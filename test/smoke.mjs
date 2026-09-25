@@ -43,7 +43,8 @@ await check('首页 GET / 返回 200 且包含关键节点', async () => {
   assert(/text\/html/.test(res.headers.get('content-type') || ''), 'content-type 非 text/html');
   const html = await res.text();
   for (const token of ['<!DOCTYPE html>', 'id="btn-solve"', 'id="steps-body"',
-    'js/app.js', 'css/style.css']) {
+    'js/app.js', 'css/style.css',
+    'id="soft-cap"', 'id="btn-soft-solve"', 'id="result-soft"', 'id="soft-transitions"']) {
     assert(html.includes(token), `首页缺少 ${token}`);
   }
 });

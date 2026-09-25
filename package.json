@@ -5,7 +5,7 @@
   "description": "芯片扫描向量浪涌约束闭环加载顺序全局裁决工具（纯静态站点）",
   "type": "module",
   "scripts": {
-    "test": "node --test test/solver.test.mjs",
+    "test": "node --test test/solver.test.mjs test/softstart.test.mjs",
     "build-check": "node scripts/build-check.mjs",
     "smoke": "node test/smoke.mjs"
   },

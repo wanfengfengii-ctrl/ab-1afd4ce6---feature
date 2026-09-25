@@ -24,6 +24,8 @@ export const MIN_VECTORS = 4;
 export const MAX_VECTORS = 12;
 export const MIN_PINS = 8;
 export const MAX_PINS = 20;
+/** 缓变加载：每个切换阶段最多同时置高的引脚数上限（取值 1..MAX_PINS） */
+export const MAX_GROUP_PINS = MAX_PINS;
 
 const INTEGER_RE = /^-?\d+$/;
 
@@ -98,7 +100,8 @@ function compareIdSeq(seqA, seqB, ids) {
 
 /**
  * 校验页面模型。
- * model = { pinCount, limit, weights:[...], vectors:[{id, bits}] }
+ * model = { pinCount, limit, weights:[...], vectors:[{id, bits}], maxGroupPins? }
+ * maxGroupPins 缺省时缓变加载关闭（仅做既有闭环裁决）。
  * 返回错误数组：[{ scope, index, message }]，空数组表示通过。
  */
 export function validateModel(model) {
@@ -115,6 +118,15 @@ export function validateModel(model) {
 
   if (!isInt(model.limit) || model.limit < 0) {
     errors.push({ scope: 'limit', message: '浪涌限额必须是不小于 0 的整数' });
+  }
+
+  if (model.maxGroupPins !== undefined && model.maxGroupPins !== null) {
+    if (!isInt(model.maxGroupPins) || model.maxGroupPins < 1 || model.maxGroupPins > MAX_GROUP_PINS) {
+      errors.push({
+        scope: 'maxGroupPins',
+        message: `缓变加载每阶段置高引脚数上限必须是 1–${MAX_GROUP_PINS} 之间的整数（当前：${String(model.maxGroupPins)}）`,
+      });
+    }
   }
 
   if (!Array.isArray(model.weights) || model.weights.length !== pinCount) {
@@ -173,6 +185,7 @@ export function validateModel(model) {
  * 格式（# 开头为注释，空行忽略，关键字大小写不敏感）：
  *   PINS 12
  *   LIMIT 100
+ *   MAXP 3               # 可选；启用缓变加载：每个切换阶段最多同时置高 3 个引脚（1..PINS）
  *   W 5 3 8 2 ...        # 恰好 PINS 个整数，顺序 P1..Pn
  *   V1 001010101000
  *   V2 110000010100
@@ -183,9 +196,11 @@ export function parseImport(text) {
   let pinCount = null;
   let limit = null;
   let weights = null;
+  let maxGroupPins = null;
   let pinsLine = null;
   let limitLine = null;
   let weightsLine = null;
+  let maxpLine = null;
   const vectors = [];
   const vectorLines = [];
 
@@ -229,6 +244,23 @@ export function parseImport(text) {
       return;
     }
 
+    if (keyword === 'MAXP') {
+      if (maxGroupPins !== null) {
+        errors.push({ line: lineNo, message: 'MAXP 重复定义' });
+        return;
+      }
+      if (parts.length !== 2 || !INTEGER_RE.test(parts[1])) {
+        errors.push({ line: lineNo, message: 'MAXP 语法应为：MAXP <1–20 的整数>（缓变加载每阶段置高引脚数上限）' });
+        return;
+      }
+      maxpLine = lineNo;
+      maxGroupPins = Number.parseInt(parts[1], 10);
+      if (maxGroupPins < 1 || maxGroupPins > MAX_GROUP_PINS) {
+        errors.push({ line: lineNo, message: `MAXP 必须在 1–${MAX_GROUP_PINS} 之间（当前：${maxGroupPins}）` });
+      }
+      return;
+    }
+
     if (keyword === 'W' || keyword === 'WEIGHTS') {
       if (weights !== null) {
         errors.push({ line: lineNo, message: '权重行 W 重复定义' });
@@ -262,7 +294,7 @@ export function parseImport(text) {
   if (limitLine === null) errors.push({ line: null, message: '缺少 LIMIT 指令' });
   if (weightsLine === null) errors.push({ line: null, message: '缺少权重行 W' });
 
-  const model = { pinCount, limit, weights: weights || [], vectors };
+  const model = { pinCount, limit, maxGroupPins, weights: weights || [], vectors };
 
   // 语义校验（位数/数量/取值/重复编号/掩码长度），把定位映射到源行号
   if (errors.length === 0) {
@@ -271,6 +303,7 @@ export function parseImport(text) {
       if (err.scope === 'pins') line = pinsLine;
       else if (err.scope === 'limit') line = limitLine;
       else if (err.scope === 'weights' || err.scope === 'weight') line = weightsLine;
+      else if (err.scope === 'maxGroupPins') line = maxpLine;
       else if ((err.scope === 'vector' || err.scope === 'vectors') && err.index != null) {
         line = vectorLines[err.index];
       }
@@ -281,11 +314,12 @@ export function parseImport(text) {
   return { model, errors };
 }
 
-/** 导出文本（与 parseImport 互逆） */
+/** 导出文本（与 parseImport 互逆；仅在启用缓变加载时写出 MAXP） */
 export function exportModel(model) {
   const lines = [];
   lines.push(`PINS ${model.pinCount}`);
   lines.push(`LIMIT ${model.limit}`);
+  if (isInt(model.maxGroupPins)) lines.push(`MAXP ${model.maxGroupPins}`);
   lines.push(`W ${model.weights.join(' ')}`);
   model.vectors.forEach((v) => lines.push(`${v.id} ${v.bits}`));
   return lines.join('\n') + '\n';
@@ -356,6 +390,461 @@ export function diagnose(model) {
     canStartCount: canStart.filter(Boolean).length,
   };
 }
+
+// ===========================================================================
+// 缓变加载（soft-start）：在“当前录入顺序”的正式向量序列上规划切换暂态
+// ===========================================================================
+//
+// 量产设备有时必须遵循已备案（即工程师录入）的向量编号顺序，不能由闭环裁决
+// 重排。缓变加载在既有录入/导入模型旁启用，与既有闭环裁决（solveModel）互不
+// 影响：正式向量严格按“当前录入顺序”执行，每个正式向量仍在其原掩码处采样。
+//
+// 每次正式跳转 prevMask -> nextMask 前可插入仅用于切换的暂态：
+//   1) 先一次性完成全部降位（1→0，降位不计浪涌）；
+//   2) 再把待置高引脚 R（本跳 0→1 的引脚）分入若干“有序阶段”依次置高。
+// 每个阶段（一组）必须同时满足：
+//   - 组内引脚权重之和 ≤ 既有浪涌限额 limit；
+//   - 组内引脚数 ≤ maxGroupPins（新上限，1..MAX_GROUP_PINS）。
+//
+// 裁决规则（对每个正式跳转都做完整比较，不用逐引脚试探或贪心装箱）：
+//   1) 插入暂态总数最少。一跳经若干切换阶段抵达正式掩码（采样点），“插入的
+//      仅切换暂态数 = 切换阶段数 - 1”（降位 0/1 个 + 置高 k 个，最后一个阶段
+//      抵达采样点本身不计入）；降位贡献对分组方案是常数，故等价于置高分组数
+//      k 最少；
+//   2) 并列时按“各阶段置高引脚的 P 序列”（阶段先后 × 组内 P 升序）字典序最小。
+// 各跳的可行分组只依赖本跳的待置高引脚集合，彼此独立；全链路暂态总数为各跳
+// 之和，因此逐跳取“完整比较后的最优”即全链路最优（同数并列时第一段差异由最
+// 先发生的正式跳转决定，逐跳取字典序最小恰好拼成全链路字典序最小）。
+
+/** 引脚编号列表（P 编号升序）对应的位掩码（与向量掩码同一坐标系） */
+function pinListToMask(pins, pinCount) {
+  let m = 0;
+  for (const p of pins) m |= 1 << (pinCount - p);
+  return m;
+}
+
+/** 两个升序引脚列表的字典序比较（测试暴力对拍使用：a<b 返回负数） */
+export function comparePinLists(a, b) {
+  const len = Math.min(a.length, b.length);
+  for (let k = 0; k < len; k += 1) {
+    if (a[k] !== b[k]) return a[k] - b[k];
+  }
+  return a.length - b.length;
+}
+
+/**
+ * 按 P 序列字典序惰性枚举 pins（升序）的全部可行非空分组，访问顺序即字典序：
+ *   [p0] < [p0,p1] < ... < [p0,p1,...] < [p0,p2] < ... < [p1] < ...
+ * 权重非负 => 延长分组只会增大权重和与引脚数，超限/超员的前缀不再扩展（这是
+ * 可行性裁剪，不替裁决做任何“选哪组”的贪心决定）。
+ * visit(picked, nextStartIdx) 返回 false 可提前停止。
+ */
+function enumerateFeasibleGroupsLex(pins, weights, limit, cap, visit) {
+  const picked = [];
+  const gen = (start, sum, size) => {
+    for (let i = start; i < pins.length; i += 1) {
+      const pin = pins[i];
+      const w = weights[pin - 1];
+      if (size + 1 > cap || sum + w > limit) continue; // 后面可能有更轻的引脚，继续
+      picked.push(pin);
+      if (visit(picked, i + 1) === false) return false;
+      if (gen(i + 1, sum + w, size + 1) === false) return false;
+      picked.pop();
+    }
+    return true;
+  };
+  gen(0, 0, 0);
+}
+
+/**
+ * 穷举一个跳变的全部“有序分组方案”（有序集划分），仅用于小规模暴力对拍/测试。
+ * 正式裁决走 bestGrouping 的迭代加深搜索（本函数在 m=20 时会呈组合爆炸）。
+ * 返回 [{ groups:Number[][], total:Number }]，未排序。
+ */
+export function enumerateOrderedGroupings(pins, weights, limit, cap) {
+  if (pins.length === 0) return [{ groups: [], total: 0 }];
+  const feasibleMasks = [];
+  const full = (1 << pins.length) - 1;
+  for (let bits = 1; bits <= full; bits += 1) {
+    if (popCount(bits) > cap) continue;
+    let sum = 0;
+    for (let k = 0; k < pins.length; k += 1) {
+      if ((bits & (1 << k)) !== 0) sum += weights[pins[k] - 1];
+    }
+    if (sum <= limit) feasibleMasks.push(bits);
+  }
+  const out = [];
+  const chosen = [];
+  const recurse = (used) => {
+    if (used === full) {
+      out.push({
+        groups: chosen.map((gm) => {
+          const g = [];
+          for (let k = 0; k < pins.length; k += 1) {
+            if ((gm & (1 << k)) !== 0) g.push(pins[k]);
+          }
+          return g;
+        }),
+        total: chosen.length,
+      });
+      return;
+    }
+    for (const gm of feasibleMasks) {
+      if ((gm & used) !== 0) continue; // 组互斥；阶段顺序由选择次序区分，完整枚举
+      chosen.push(gm);
+      recurse(used | gm);
+      chosen.pop();
+    }
+  };
+  recurse(0);
+  return out;
+}
+
+/**
+ * 对一个正式跳转的待置高引脚做完整裁决：
+ * 迭代加深 DFS —— 从组数下界开始逐层加深，每层遍历该深度下的全部有序分组；
+ * 第一个成功的方案就是“组数最少且 P 序列字典序最小”者。
+ * 不做逐引脚/贪心装箱：同一深度下所有互斥分组及其阶段顺序都会被比较，
+ * 必要的裁剪只有不可行下界（引脚数、权重和）与失败状态记忆。
+ *
+ * 返回 { feasible, groups, totalTransients, feasibleGroups, lowerBound, triedK }
+ * 不可行返回 { feasible:false, reason }。
+ */
+export function bestGrouping(risePins, weights, limit, cap) {
+  if (risePins.length === 0) {
+    return { feasible: true, groups: [], totalTransients: 0, feasibleGroups: 0, lowerBound: 0, triedK: [0] };
+  }
+
+  // 单引脚权重大于限额：任何阶段都无法置高（降位不产生浪涌，无可绕行暂态）
+  const overweight = risePins.filter((p) => weights[p - 1] > limit);
+  if (overweight.length > 0) {
+    return {
+      feasible: false,
+      reason: 'overweight',
+      overweightPins: overweight,
+    };
+  }
+
+  const totalSum = risePins.reduce((s, p) => s + weights[p - 1], 0);
+  // 可容许下界（只可能低估、不会高估所需组数，故用于剪枝绝不误杀可行解）：
+  //   引脚数下界 ceil(m/cap)；权重和下界 ceil(sum/limit)；
+  //   装箱下界：权重 > limit/2 的“重引脚”两两不能同组，各占一组，其余轻引脚
+  //   先填充这些组的剩余额度，填不下再按 limit 追加组数（此处忽略引脚数上限，
+  //   只会让下界更松，仍然安全）。
+  const lowerBound = groupLowerBound(risePins, weights, limit, cap);
+
+  // 根层可行组计数（完整枚举一遍所有可行非空组，供汇报“完整比较”规模）
+  let feasibleGroups = 0;
+  enumerateFeasibleGroupsLex(risePins, weights, limit, cap, () => {
+    feasibleGroups += 1;
+  });
+
+  const path = [];
+  const triedK = [];
+  // 失败记忆：键 = 残集位掩码 × 剩余组数。同一 (残集, 剩余组数) 子问题的
+  // 可行性是确定的，且与迭代加深的层级、到达路径无关，故跨层级持久保留；
+  // 记忆只做剪枝，不影响“字典序首个成功即最优”的完备性。
+  const failed = new Set();
+
+  // rem 为“尚未置高”的引脚编号升序列表
+  const dfs = (rem, groupsLeft) => {
+    if (rem.length === 0) return groupsLeft === 0;
+    if (groupsLeft === 0) return false;
+    // 可容许下界：残集所需组数下界超过剩余组数则必无解
+    if (groupLowerBound(rem, weights, limit, cap) > groupsLeft) return false;
+
+    let solution = false;
+    enumerateFeasibleGroupsLex(rem, weights, limit, cap, (group) => {
+      if (solution) return false;
+      const rest = rem.filter((p) => !group.includes(p));
+      const restKey = rest.length === 0 ? 0 : pinListToMask(rest, weights.length);
+      const memoKey = restKey * 32 + (groupsLeft - 1); // 残集 × 剩余组数
+      if (failed.has(memoKey)) return true; // 该子问题已被证明无解
+      path.push(group.slice());
+      if (dfs(rest, groupsLeft - 1)) {
+        solution = true;
+        return false; // 停止枚举：字典序首个成功即全局最优
+      }
+      path.pop();
+      failed.add(memoKey);
+      return true;
+    });
+    return solution;
+  };
+
+  // 单引脚组恒可行（w ≤ limit 且 cap ≥ 1），故 k = risePins.length 必然成功；
+  // 仍保留失败出口以覆盖任何意料之外的约束组合。
+  for (let k = lowerBound; k <= risePins.length; k += 1) {
+    triedK.push(k);
+    path.length = 0;
+    if (dfs(risePins.slice(), k)) {
+      return {
+        feasible: true,
+        groups: path.map((g) => g.slice()),
+        totalTransients: k,
+        feasibleGroups,
+        lowerBound,
+        triedK,
+      };
+    }
+  }
+
+  return {
+    feasible: false,
+    reason: 'ungroupable',
+    feasibleGroups,
+    lowerBound,
+    triedK,
+  };
+}
+
+/**
+ * 分组所需组数的可容许下界（admissible，绝不高估）：
+ *   max(ceil(引脚数/cap), 权重和/limit 装箱下界)。
+ * 装箱下界：重引脚（w > limit/2）两两不能同组，各占一组；轻引脚先占用这些组
+ * 的残余额度，仍装不下的部分按每组至多 limit 权重追加组数。
+ */
+function groupLowerBound(pins, weights, limit, cap) {
+  const byCount = Math.ceil(pins.length / cap);
+  let heavy = 0;
+  let sumHeavy = 0;
+  let sumLight = 0;
+  for (const p of pins) {
+    const w = weights[p - 1];
+    if (limit > 0 && w * 2 > limit) { heavy += 1; sumHeavy += w; }
+    else sumLight += w;
+  }
+  const spareInHeavy = Math.max(0, heavy * limit - sumHeavy);
+  const extra = limit > 0
+    ? Math.ceil(Math.max(0, sumLight - spareInHeavy) / limit)
+    : 0;
+  return Math.max(byCount, heavy + extra);
+}
+
+/**
+ * 规划单个正式跳转（prevMask -> nextMask）的全部切换暂态。
+ * 返回：
+ *   可行 { feasible:true, prevMask, nextMask, fallPins, risePins, best, stages }
+ *   不可行 { feasible:false, reason:{code,message,pins?}, fallPins, risePins }
+ */
+export function planHopTransients(prevMask, nextMask, pinCount, weights, limit, maxGroupPins) {
+  const fallPins = [];
+  const risePins = [];
+  for (let p = 1; p <= pinCount; p += 1) {
+    const bit = 1 << (pinCount - p);
+    const was1 = (prevMask & bit) !== 0;
+    const now1 = (nextMask & bit) !== 0;
+    if (was1 && !now1) fallPins.push(p);
+    else if (!was1 && now1) risePins.push(p);
+  }
+
+  if (risePins.some((p) => weights[p - 1] > limit)) {
+    const bad = risePins.filter((p) => weights[p - 1] > limit);
+    return {
+      feasible: false,
+      prevMask,
+      nextMask,
+      fallPins,
+      risePins,
+      reason: {
+        code: 'overweight',
+        pins: bad,
+        message: `引脚 ${bad.map((p) => `P${p}（权重=${weights[p - 1]}）`).join('、')
+        } 自身权重已大于浪涌限额 ${limit}，任何切换阶段将其置高都会超限`,
+      },
+    };
+  }
+
+  const result = bestGrouping(risePins, weights, limit, maxGroupPins);
+  if (!result.feasible) {
+    return {
+      feasible: false,
+      prevMask,
+      nextMask,
+      fallPins,
+      risePins,
+      reason: {
+        code: 'ungroupable',
+        message: `待置高引脚 ${risePins.map((p) => `P${p}（权重=${weights[p - 1]}）`).join('、')
+        } 无法在“每组权重和 ≤ ${limit} 且每组引脚数 ≤ ${maxGroupPins}”下完成完整分组`,
+      },
+    };
+  }
+
+  // 先降位：一次性完成所有 1→0
+  const afterFallMask = prevMask & nextMask;
+  const stages = [];
+  if (fallPins.length > 0) {
+    stages.push({
+      kind: 'fall',
+      name: '降位暂态',
+      pins: fallPins.map((p) => ({ pin: `P${p}`, weight: weights[p - 1] })),
+      maskBefore: prevMask,
+      maskAfter: afterFallMask,
+      surge: 0,
+      sample: false,
+    });
+  }
+  // 再分组置高
+  result.groups.forEach((group, gi) => {
+    const before = afterFallMask
+      | pinListToMask(result.groups.slice(0, gi).reduce((a, g) => a.concat(g), []), pinCount);
+    const after = afterFallMask
+      | pinListToMask(result.groups.slice(0, gi + 1).reduce((a, g) => a.concat(g), []), pinCount);
+    stages.push({
+      kind: 'rise',
+      name: `置高暂态 ${gi + 1}/${result.groups.length}`,
+      pins: group.map((p) => ({ pin: `P${p}`, weight: weights[p - 1] })),
+      maskBefore: before,
+      maskAfter: after,
+      surge: group.reduce((s, p) => s + weights[p - 1], 0),
+      sample: false,
+    });
+  });
+  // 采样点：正式向量在原掩码处采样（暂态序列结束后的稳定态）
+  stages.push({
+    kind: 'sample',
+    name: '正式采样',
+    pins: [],
+    maskBefore: nextMask,
+    maskAfter: nextMask,
+    surge: 0,
+    sample: true,
+  });
+
+  // 切换阶段数 = 降位阶段（0/1）+ 置高阶段数 k。最后一个切换阶段抵达正式掩码
+  // （即采样点）本身，故“插入”的仅切换暂态数 = 切换阶段数 - 1：
+  //   无降位且一组直达 -> 0；无降位分 k 组 -> k-1；有降位再分 k 组 -> k；
+  //   纯降位（无置高）-> 0。降位贡献对分组方案是常数，最小化插入暂态等价于
+  //   最小化置高分组数 k（bestGrouping 已做完整裁决）。
+  const fallStages = fallPins.length > 0 ? 1 : 0;
+  const riseStages = result.groups.length;
+  const switchingStages = fallStages + riseStages;
+  const insertedTransients = Math.max(0, switchingStages - 1);
+
+  return {
+    feasible: true,
+    prevMask,
+    nextMask,
+    fallPins,
+    risePins,
+    best: { groups: result.groups, totalTransients: result.totalTransients },
+    feasibleGroups: result.feasibleGroups,
+    lowerBound: result.lowerBound,
+    triedK: result.triedK,
+    switchingStages,
+    insertedTransients,
+    stages,
+  };
+}
+
+/**
+ * 缓变加载全局规划：严格按当前录入顺序，从全零出发、逐正式向量在原掩码采样、
+ * 最终回零；每个正式跳转前插入经完整比较的切换暂态。
+ *
+ * 成功返回：
+ *   { ok:true, mode:'soft-start', feasible:true, sequence:[id...],
+ *     totalTransients, transitions:[{ hop, kind, vectorId, prevBits, nextBits,
+ *       fallPins, risePins, transientCount, cumulativeTransients, stages,
+ *       feasibleGroups }], returnHop:{...} }
+ * 存在无法分组的正式跳转：
+ *   { ok:true, mode:'soft-start', feasible:false, sequence, infeasible:[...] }
+ * 输入非法：{ ok:false, errors }
+ */
+export function solveSoftStart(model) {
+  const errors = validateModel(model);
+  if (errors.length > 0) return { ok: false, errors };
+  if (!isInt(model.maxGroupPins) || model.maxGroupPins < 1 || model.maxGroupPins > MAX_GROUP_PINS) {
+    return {
+      ok: false,
+      errors: [{
+        scope: 'maxGroupPins',
+        message: `启用缓变加载时必须填写 1–${MAX_GROUP_PINS} 之间的每阶段置高引脚数上限`,
+      }],
+    };
+  }
+
+  const { pinCount, weights, limit, maxGroupPins } = model;
+  const vectors = model.vectors;
+  const n = vectors.length;
+  const ids = vectors.map((v) => v.id);
+  const masks = vectors.map((v) => maskFromBits(v.bits));
+
+  const buildTransition = (hop, kind, vectorId, prevMask, nextMask) => {
+    const plan = planHopTransients(prevMask, nextMask, pinCount, weights, limit, maxGroupPins);
+    return { hop, kind, vectorId, ...plan };
+  };
+
+  // 正式跳转：全零 -> V(录入顺序[0]) -> ... -> V(录入顺序[n-1])，最后回零
+  const hops = [];
+  for (let h = 0; h < n; h += 1) {
+    const prevMask = h === 0 ? 0 : masks[h - 1];
+    hops.push(buildTransition(h + 1, 'vector', ids[h], prevMask, masks[h]));
+  }
+  hops.push(buildTransition(n + 1, 'return', null, masks[n - 1], 0));
+
+  const infeasible = hops
+    .filter((p) => !p.feasible)
+    .map((p) => ({
+      hop: p.hop,
+      kind: p.kind,
+      vectorId: p.vectorId,
+      reason: p.reason,
+      fallPins: p.fallPins,
+      risePins: p.risePins,
+    }));
+  if (infeasible.length > 0) {
+    return {
+      ok: true,
+      mode: 'soft-start',
+      feasible: false,
+      sequence: ids,
+      maxGroupPins,
+      infeasible,
+    };
+  }
+
+  let cumulativeTransients = 0;
+  const decorate = (p) => ({
+    hop: p.hop,
+    kind: p.kind,
+    vectorId: p.vectorId,
+    prevMask: p.prevMask,
+    nextMask: p.nextMask,
+    prevBits: maskToBinary(p.prevMask, pinCount),
+    nextBits: maskToBinary(p.nextMask, pinCount),
+    sampleBits: maskToBinary(p.nextMask, pinCount),
+    fallPins: p.fallPins.map((q) => ({ pin: `P${q}`, weight: weights[q - 1] })),
+    risePins: p.risePins.map((q) => ({ pin: `P${q}`, weight: weights[q - 1] })),
+    feasibleGroups: p.feasibleGroups,
+    riseGroupCount: p.best.totalTransients, // 置高分组数 k（裁决对象）
+    switchingStages: p.switchingStages,
+    insertedTransients: p.insertedTransients, // 本跳插入的仅切换暂态数
+    stages: p.stages.map((s) => ({
+      ...s,
+      bitsBefore: maskToBinary(s.maskBefore, pinCount),
+      bitsAfter: maskToBinary(s.maskAfter, pinCount),
+    })),
+  });
+
+  const transitions = hops.slice(0, n).map((p) => {
+    cumulativeTransients += p.insertedTransients;
+    return { ...decorate(p), cumulativeTransients };
+  });
+  const returnHop = decorate(hops[n]); // 回零跳：只有降位，无置高暂态
+
+  return {
+    ok: true,
+    mode: 'soft-start',
+    feasible: true,
+    sequence: ids,
+    maxGroupPins,
+    totalTransients: cumulativeTransients,
+    transitions,
+    returnHop,
+  };
+}
+
 
 /**
  * 全局裁决求解。

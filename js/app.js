@@ -11,6 +11,7 @@ const $ = (sel) => document.querySelector(sel);
 const els = {
   pinCount: $('#pin-count'),
   limit: $('#limit'),
+  softCap: $('#soft-cap'),
   pinsTail: $('#pins-tail'),
   weightsGrid: $('#weights-grid'),
   vectorsBody: $('#vectors-body'),
@@ -19,6 +20,7 @@ const els = {
   btnImport: $('#btn-import'),
   btnExport: $('#btn-export'),
   btnSolve: $('#btn-solve'),
+  btnSoftSolve: $('#btn-soft-solve'),
   importText: $('#import-text'),
   hint: $('#solve-hint'),
   staleBanner: $('#stale-banner'),
@@ -34,6 +36,15 @@ const els = {
   stepsBody: $('#steps-body'),
   infTotal: $('#inf-total'),
   infDiagnosis: $('#inf-diagnosis'),
+  soft: $('#result-soft'),
+  softInfeasible: $('#result-soft-infeasible'),
+  softChain: $('#soft-chain'),
+  softStatTransients: $('#soft-stat-transients'),
+  softStatCap: $('#soft-stat-cap'),
+  softStatN: $('#soft-stat-n'),
+  softMeta: $('#soft-meta'),
+  softTransitions: $('#soft-transitions'),
+  softInfeasibleBody: $('#soft-infeasible'),
 };
 
 // ---------- Worker ----------
@@ -46,7 +57,7 @@ function getWorker() {
   if (worker === null) {
     worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
     worker.onmessage = (e) => {
-      const { type, nonce, result, message } = e.data || {};
+      const { type, nonce, result, message, mode } = e.data || {};
       if (nonce !== latestNonce) return; // 已被更新的裁决取代
       els.hint.classList.remove('computing');
       els.hint.textContent = '';
@@ -54,7 +65,8 @@ function getWorker() {
         showFatal('求解器内部错误：\n' + message);
         return;
       }
-      renderResult(result);
+      if (mode === 'soft-start') renderSoftResult(result);
+      else renderResult(result);
     };
     worker.onerror = (e) => {
       els.hint.classList.remove('computing');
@@ -144,15 +156,18 @@ function updateAddDeleteState() {
 
 // ---------- 编辑即撤结论 ----------
 function markStale() {
-  // 任何编辑（含导入失败后）都立即撤下上一轮的全部结论与错误定位
+  // 任何编辑（含导入失败后、切换缓变上限）都立即撤下上一轮的全部结论与错误定位，
+  // 既有闭环裁决报告与缓变加载报告一并撤下。
   els.feasible.hidden = true;
   els.infeasible.hidden = true;
+  els.soft.hidden = true;
+  els.softInfeasible.hidden = true;
   els.empty.hidden = !hadConclusion;
   els.errorBanner.hidden = true;
   els.errorBanner.textContent = '';
   clearRowErrors();
   if (hadConclusion) els.staleBanner.hidden = false;
-  latestNonce += 1; // 使在途的裁决结果失效
+  latestNonce += 1; // 使在途的裁决结果失效（闭环/缓变两种模式都作废）
   els.hint.classList.remove('computing');
   els.hint.textContent = '';
 }
@@ -165,9 +180,16 @@ function clearRowErrors() {
     if (cell) cell.textContent = '';
   });
   els.weightsGrid.querySelectorAll('input').forEach((i) => i.classList.remove('invalid'));
+  els.softCap.classList.remove('invalid');
+  els.softCap.title = '';
 }
 
 // ---------- 收集模型 ----------
+function readSoftCap() {
+  const raw = els.softCap.value.trim();
+  return /^-?\d+$/.test(raw) ? Number.parseInt(raw, 10) : els.softCap.value;
+}
+
 function collectModel() {
   const pinCount = readPinCount();
   const limitRaw = els.limit.value.trim();
@@ -180,7 +202,7 @@ function collectModel() {
     id: tr.querySelector('.tf-id').value.trim(),
     bits: tr.querySelector('.tf-bits').value.trim(),
   }));
-  return { pinCount, limit, weights, vectors };
+  return { pinCount, limit, maxGroupPins: readSoftCap(), weights, vectors };
 }
 
 // ---------- 错误定位 ----------
@@ -203,6 +225,10 @@ function showValidationErrors(errors) {
         const isBitsMsg = /掩码/.test(err.message);
         tr.querySelector(isBitsMsg ? '.tf-bits' : '.tf-id').classList.add('invalid');
       }
+    } else if (err.scope === 'maxGroupPins') {
+      els.softCap.classList.add('invalid');
+      els.softCap.title = err.message;
+      globalLines.push('• ' + err.message);
     } else {
       globalLines.push('• ' + err.message);
     }
@@ -223,19 +249,24 @@ function showFatal(text) {
 }
 
 // ---------- 执行裁决 ----------
+// 既有闭环裁决：严格使用原模型，剥离缓变加载参数，保证语义与原先完全一致。
+function closedLoopModel(full) {
+  const { maxGroupPins, ...rest } = full;
+  return rest;
+}
+
 function solve() {
   els.staleBanner.hidden = true;
   els.errorBanner.hidden = true;
   clearRowErrors();
 
-  const model = collectModel();
+  const model = closedLoopModel(collectModel());
   currentLimit = typeof model.limit === 'number' ? model.limit : null;
 
   const errors = validateModel(model);
   if (errors.length > 0) {
     hadConclusion = true;
-    els.feasible.hidden = true;
-    els.infeasible.hidden = true;
+    hideAllResults();
     els.empty.hidden = true;
     showValidationErrors(errors);
     return;
@@ -244,7 +275,39 @@ function solve() {
   const nonce = ++latestNonce;
   els.hint.classList.add('computing');
   els.hint.textContent = '正在完整比较全部闭环顺序…';
-  getWorker().postMessage({ model, nonce });
+  getWorker().postMessage({ model, nonce, mode: 'closed-loop' });
+}
+
+// ---------- 执行缓变加载规划 ----------
+function solveSoft() {
+  els.staleBanner.hidden = true;
+  els.errorBanner.hidden = true;
+  clearRowErrors();
+
+  const model = collectModel();
+  currentLimit = typeof model.limit === 'number' ? model.limit : null;
+
+  // 复用同一套录入校验；缓变模式额外要求每阶段引脚上限为 1..20 的整数
+  const errors = validateModel(model);
+  if (errors.length > 0) {
+    hadConclusion = true;
+    hideAllResults();
+    els.empty.hidden = true;
+    showValidationErrors(errors);
+    return;
+  }
+
+  const nonce = ++latestNonce;
+  els.hint.classList.add('computing');
+  els.hint.textContent = '正在完整比较每个正式跳转的全部分组与阶段顺序…';
+  getWorker().postMessage({ model, nonce, mode: 'soft-start' });
+}
+
+function hideAllResults() {
+  els.feasible.hidden = true;
+  els.infeasible.hidden = true;
+  els.soft.hidden = true;
+  els.softInfeasible.hidden = true;
 }
 
 // ---------- 渲染结论 ----------
@@ -253,6 +316,8 @@ function renderResult(result) {
   els.empty.hidden = true;
   els.staleBanner.hidden = true;
   els.errorBanner.hidden = true;
+  els.soft.hidden = true;
+  els.softInfeasible.hidden = true;
 
   if (!result.feasible) {
     els.feasible.hidden = true;
@@ -311,6 +376,118 @@ function renderResult(result) {
   });
 }
 
+// ---------- 渲染缓变加载结论 ----------
+function renderSoftResult(result) {
+  hadConclusion = true;
+  els.empty.hidden = true;
+  els.staleBanner.hidden = true;
+  els.errorBanner.hidden = true;
+  els.feasible.hidden = true;
+  els.infeasible.hidden = true;
+
+  if (!result.feasible) {
+    els.soft.hidden = true;
+    els.softInfeasible.hidden = false;
+    els.softInfeasibleBody.innerHTML = result.infeasible.map((p) => {
+      const target = p.kind === 'return'
+        ? '↩ 收尾回零跳'
+        : `正式跳转 ${p.hop} → 向量 ${escapeHtml(p.vectorId)}`;
+      const rise = p.risePins.length
+        ? `待置高引脚：${p.risePins.map((q) => `P${q}`).join('、')}`
+        : '无待置高引脚';
+      return `<div class="soft-infeasible-item">
+        <div><strong>${target}</strong></div>
+        <div class="muted small">${rise}</div>
+        <div>${escapeHtml(p.reason.message)}</div>
+      </div>`;
+    }).join('');
+    return;
+  }
+
+  els.softInfeasible.hidden = true;
+  els.soft.hidden = false;
+
+  const chain = ['<span class="node">0</span>'];
+  result.sequence.forEach((id) => {
+    chain.push('<span class="arrow">→</span>', `<span class="node">${escapeHtml(id)}</span>`);
+  });
+  chain.push('<span class="arrow">→</span>', '<span class="ret">0（全零态）</span>');
+  els.softChain.innerHTML = chain.join(' ');
+
+  els.softStatTransients.textContent = String(result.totalTransients);
+  els.softStatCap.textContent = String(result.maxGroupPins);
+  els.softStatN.textContent = String(result.sequence.length);
+  els.softMeta.textContent =
+    '严格按录入/备案顺序执行；每个正式跳转的分组都经过“先最少插入暂态数、同数按各阶段置高引脚 P 序列字典序最小”的完整比较（非逐引脚、非贪心装箱）。';
+
+  els.softTransitions.innerHTML = '';
+  result.transitions.forEach((t) => els.softTransitions.append(renderHopCard(t, currentLimit)));
+  els.softTransitions.append(renderHopCard(result.returnHop, currentLimit));
+}
+
+function renderHopCard(t, limit) {
+  const card = document.createElement('div');
+  card.className = 'hop-card' + (t.kind === 'return' ? ' return-card' : '');
+
+  const execName = t.kind === 'return'
+    ? '↩ 收尾回零（最终回全零）'
+    : `跳转 ${t.hop} · 采样向量 ${escapeHtml(t.vectorId)}`;
+  const head = document.createElement('div');
+  head.className = 'hop-head';
+  head.innerHTML = `
+    <span class="hop-no">#${t.hop}</span>
+    <span class="hop-name">${execName}</span>
+    <span class="hop-counts">
+      暂态前掩码 <code>${t.prevBits}</code> → 采样点掩码 <code>${t.nextBits}</code>
+      · 本跳插入暂态 <strong>${t.insertedTransients}</strong>
+      · 置高分组 ${t.riseGroupCount}
+      ${t.kind === 'vector' ? `· 累计暂态 <strong>${t.cumulativeTransients}</strong>` : ''}
+    </span>`;
+  card.append(head);
+
+  const table = document.createElement('table');
+  table.className = 'stage-table';
+  table.innerHTML = `
+    <thead><tr>
+      <th>阶段</th><th>暂态前掩码</th><th>暂态后掩码</th>
+      <th>置高引脚（权重）</th><th>浪涌/限额</th>
+    </tr></thead><tbody></tbody>`;
+  const tbody = table.querySelector('tbody');
+
+  t.stages.forEach((s) => {
+    const tr = document.createElement('tr');
+    if (s.kind === 'fall') tr.classList.add('stage-row-fall');
+    if (s.kind === 'sample') tr.classList.add('stage-row-sample');
+
+    let nameHtml;
+    if (s.kind === 'fall') nameHtml = '<span class="fall-tag">↓ 降位暂态（1→0）</span>';
+    else if (s.kind === 'sample') nameHtml = '<span class="sample-tag">● 正式采样点</span>';
+    else nameHtml = escapeHtml(s.name);
+
+    const pinsHtml = s.pins.length === 0
+      ? '<span class="muted">—</span>'
+      : '<span class="pins-cell">' +
+        s.pins.map((pp) => `<span class="chip">${escapeHtml(pp.pin)}(w=${pp.weight})</span>`).join('') +
+        '</span>';
+
+    const surgeText = s.kind === 'fall' || s.kind === 'sample'
+      ? '0'
+      : `${s.surge}${limit != null ? ` / ${limit}` : ''}`;
+    const over = s.kind === 'rise' && limit != null && s.surge > limit;
+
+    tr.innerHTML = `
+      <td class="stage-name">${nameHtml}</td>
+      <td class="bits">${s.bitsBefore}</td>
+      <td class="bits">${s.bitsAfter}</td>
+      <td>${pinsHtml}</td>
+      <td class="surge-cell ${over ? 'over' : ''}">${surgeText}</td>`;
+    tbody.append(tr);
+  });
+
+  card.append(table);
+  return card;
+}
+
 function colorBits(bits, riseSet, fallSet) {
   let html = '';
   for (let k = 0; k < bits.length; k += 1) {
@@ -366,21 +543,29 @@ function doImport() {
   }
   els.pinCount.value = String(model.pinCount);
   els.limit.value = String(model.limit);
+  if (Number.isInteger(model.maxGroupPins)) els.softCap.value = String(model.maxGroupPins);
   renderWeights(model.weights);
   els.vectorsBody.innerHTML = '';
   model.vectors.forEach((v) => addVectorRow(v.id, v.bits));
-  solve();
+  // 导入文本含 MAXP（缓变上限）时直接出缓变规划，否则保持原闭环裁决行为
+  if (Number.isInteger(model.maxGroupPins)) solveSoft();
+  else solve();
 }
 
 function doExport() {
-  const model = collectModel();
-  const errors = validateModel(model);
+  const full = collectModel();
+  const { maxGroupPins, ...base } = full;
+  const errors = validateModel(base);
   if (errors.length > 0) {
     markStale();
     showValidationErrors(errors);
     return;
   }
-  els.importText.value = exportModel(model);
+  // MAXP 为可选项：仅当上限是 1..20 的整数时才写入导出文本
+  const exportObj = Number.isInteger(maxGroupPins) && maxGroupPins >= 1 && maxGroupPins <= 20
+    ? { ...base, maxGroupPins }
+    : base;
+  els.importText.value = exportModel(exportObj);
 }
 
 // ---------- 绑定 ----------
@@ -391,6 +576,7 @@ function bind() {
     markStale();
   });
   els.limit.addEventListener('input', markStale);
+  els.softCap.addEventListener('input', markStale); // 上限编辑立即撤下旧报告（两种模式都撤）
   els.weightsGrid.addEventListener('input', markStale);
   els.vectorsBody.addEventListener('input', markStale);
 
@@ -410,6 +596,7 @@ function bind() {
     }
   });
   els.btnSolve.addEventListener('click', solve);
+  els.btnSoftSolve.addEventListener('click', solveSoft);
   els.btnImport.addEventListener('click', doImport);
   els.btnExport.addEventListener('click', doExport);
   els.btnSample.addEventListener('click', () => {
